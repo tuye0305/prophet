@@ -8,3 +8,8 @@ We share example scripts for conduct simulation analysis in examining the propos
 (4) memberLevelProphetUtils.R - This file covers the util func- tions to enable the member-level estimations (both Causal Tree or Two-Model method with regression tree models) paired with deterministic optimization (CT.DT, TM.DT).
 (5) StochasticOpSimulation.R - This code runs the stochastic optimization routine to identify the optimal parameter in each cohort. Running the code as is should generate the plot as shown in Figure 7.
 We have also used the open source R libraries simcausal [17] to generate simulation datasets, and the Causal Tree library (https: //github.com/susanathey/causalTree) to identify the cohorts and estimate effects for each treatment j and metric k. Using these, the entire methodology discussed in this paper can be easily reproduced for any similar problem of interest for small scale problems.
+
+Instruction to run the simulation:
+- Please add your work directory to "homePath" in multipleRunSimulation.R.
+- run multipleRunSimulation.R
+
