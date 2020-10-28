@@ -34,16 +34,56 @@ trainCausalTree <- function(homePath, outcomeList, treatmentList, minLeafSize){
       rpart.plot(tree)
       rpart.plot(opfit)
       dev.off()
+      statsDf <- calculateStatsTree(dataNew, opfit, "lixTreatment", "label")
+      statsDf.ordered <- statsDf[order(statsDf$delta),]
       
       labels <- labels(opfit)[- 1]
       uniqueVariables <- unique(lapply(labels, function (x) {unlist(strsplit(x, "<|>|="))[1]}))
       decisionTable <- convertToRules(opfit, uniqueVariables, dataNew)
-      write.csv(decisionTable, file = paste(homePath, treatment, outcome, 'decisionTable.csv', sep = ""), row.names = FALSE, quote = FALSE)
+      
+      decisionTableEmpty <- data.frame("rule" = c("Rule 0:"), "delta" = c(0), "cover" = c(nrow(dataNew)), "pcover" = c(1))
+      decisionTable.ordered <- if(nrow(decisionTable) > 0) decisionTable[order(decisionTable$delta),] else decisionTableEmpty
+      
+      decisionTable.expand <- cbind(decisionTable.ordered[,!(names(decisionTable.ordered) %in% c("delta"))], statsDf.ordered)
+      write.csv(decisionTable.expand, file = paste(homePath, treatment, outcome, 'decisionTable.csv', sep = ""), row.names = FALSE, quote = FALSE)
+      write.csv(statsDf.ordered, file = paste(homePath, treatment, outcome, 'xlntStats.csv', sep = ""), row.names = FALSE, quote = FALSE)
       names(dataNew)[names(dataNew) == "label"] <- outcome
     }
   }
 }
 
+calculateStatsTree <- function(df, tree, treatmentVar, label) {
+  statsDf <- data.frame("delta" = c(), "deltaPercent" = c(), "pValue" = c(), "variance" = c())
+  df$leaves <- predict(object = tree, newdata = df, type = 'vector')
+  df$leavesFactor <- factor(round(df$leaves, 4))
+  cnt <- 0
+  for (l in levels(df$leavesFactor)) {
+    cnt <- cnt + 1
+    treatmentIds <- which(df$leavesFactor == l & df[[treatmentVar]] == 1)
+    controlIds <- which(df$leavesFactor == l & df[[treatmentVar]] == 0)
+    y1 <- mean(df[[label]][treatmentIds])
+    y0 <- mean(df[[label]][controlIds])
+    n1 <- as.numeric(nrow(df[treatmentIds,]))
+    n0 <- as.numeric(nrow(df[controlIds,]))
+    varY1 <- var(df[[label]][treatmentIds]) / n1
+    varY0 <- var(df[[label]][controlIds]) / n0
+    
+    delta <- y1 - y0
+    deltaPercent <- (delta * 1.0) / y0
+    variance <- varY1 + varY0
+    varianceDeltaPercent <- (1 / y0 ^ 2) * varY1 + (y1 ^ 2 / y0 ^ 4) * varY0
+    
+    tStatsDeltaPercent <- deltaPercent / sqrt(varianceDeltaPercent)
+    
+    pValueDeltaPercent <- 2 * pnorm(- abs(tStatsDeltaPercent))
+    errorMarginDeltaPercent <- 1.96 * sqrt(varianceDeltaPercent)
+    statsDf[cnt, "delta"] <- delta
+    statsDf[cnt, "deltaPercent"] <- deltaPercent
+    statsDf[cnt, "pValueDeltaPercent"] <- pValueDeltaPercent
+    statsDf[cnt, "variance"] <- variance
+  }
+  statsDf
+}
 
 calculateStats <- function(df, outcome) {
 
@@ -65,12 +105,15 @@ calculateStats <- function(df, outcome) {
   
   pValueDeltaPercent <- 2 * pnorm(- abs(tStatsDeltaPercent))
   errorMarginDeltaPercent <- 1.96 * sqrt(varianceDeltaPercent)
-  return(c(delta, variance, deltaPercent))
+  n <- n0 + n1
+  delta <- if (n == 0) 0 else delta
+  variance <- if (n == 0) 0 else if (is.na(variance)) var(df[[outcome]])/n else variance
+  return(c(delta, variance, deltaPercent, n))
 }
 
 calculateUtilities <- function(decisionTable, homePath, outcome, treatmentList){
   #the first feature starts at column 4, hence we extract the column names from 4th till the end.
-  featureNames <- names(decisionTable)[ 5:length(names(decisionTable))]
+  featureNames <- names(decisionTable)[ 4: (length(names(decisionTable))-4)]
   treatmentColumn <- c()
   cohortColumn <- c()
   utilityColumn <- c()
@@ -81,7 +124,7 @@ calculateUtilities <- function(decisionTable, homePath, outcome, treatmentList){
       treatmentColumn <- c(treatmentColumn, treatment)
       
       filteredData <- inputData
-      ruleName <- decisionTable$rule[[row]]
+      ruleName <- as.character(decisionTable$rule[[row]])
       cohortColumn <- c(cohortColumn, ruleName)
       pcover <- decisionTable$pcover[[row]]
       for (i in 1:length(featureNames)) {
@@ -97,6 +140,43 @@ calculateUtilities <- function(decisionTable, homePath, outcome, treatmentList){
   return(resultDF)
 }
 
+
+calculateUtilitiesMergedTree <- function(decisionTableMerged, homePath, outcome, treatmentList){
+  #the first feature starts at column 4, hence we extract the column names from 4th till the end.
+  featureNames <- names(decisionTableMerged)[4:7]
+  treatmentColumn <- c()
+  cohortColumn <- c()
+  utilityColumn <- c()
+  pcoverList <- c()
+  for (row in 1:nrow(decisionTableMerged)) {
+    inputData <- fread(paste0(homePath, treatmentList[1], 'SimulationDataTraining.csv'), sep = ",", stringsAsFactors = FALSE, header = TRUE)
+    filteredData <- inputData
+    n.total <- nrow(inputData)
+    for (i in 1:length(featureNames)) {
+      feature <- featureNames[[i]]
+      featureRange <- decisionTableMerged[[feature]][[row]]
+      filteredData <- subsetData(filteredData, featureRange, feature)
+    }
+    stats<- calculateStats(filteredData, outcome)
+    pcover <- as.double(stats[[4]])/n.total
+    pcoverList <- c(pcoverList, pcover)
+  }
+  
+  for (treatment in treatmentList){
+    for (row in 1:nrow(decisionTableMerged)) {
+      treatmentColumn <- c(treatmentColumn, treatment)
+      ruleName <- paste("Rule number:", row)
+      cohortColumn <- c(cohortColumn, ruleName)
+      delta <- decisionTableMerged[[paste0("delta",treatment,outcome)]][[row]]
+      variance <- decisionTableMerged[[paste0("variance",treatment,outcome)]][[row]]
+      stats<- calculateStats(filteredData, outcome)
+      pcover <- pcoverList[[row]]
+      utilityColumn <- c(utilityColumn, paste(delta, "; ", variance, "; ", pcover))
+    }
+  }
+  resultDF <- data.frame("cohort" = cohortColumn, "treatment" = treatmentColumn, "utilities" = utilityColumn)
+  return(resultDF)
+}
 
 trimBucket <- function (x){
   # trim a string to remove white spaces
@@ -118,8 +198,8 @@ subsetData <- function(experimentData, featureRange, featureName){
     lowerbound <- as.numeric(trimws(featureBounds[1]))
     upbound <- as.numeric(trimws(featureBounds[2]))
     
-    rightInclusive <- if (grepl("\\]", featureRange)) T else F
-    leftInclusive <- if (grepl("\\[", featureRange)) T else F
+    rightInclusive <- F
+    leftInclusive <- T
     
     filteredData <- subset(filteredData, 
        if (rightInclusive) filteredData[[featureName]] <= upbound else filteredData[[featureName]] < upbound
@@ -132,7 +212,7 @@ subsetData <- function(experimentData, featureRange, featureName){
 
 
 scoreTestDataGeneratePolicy <- function(decisionTable, homePath, treatmentList,  finalAssignment, method = "SGD"){
-  featureNames <- names(decisionTable)[ 5:length(names(decisionTable))]
+  featureNames <- names(decisionTable)[ 4: (length(names(decisionTable))-4)]
   outputData <- data.frame("ID" = as.numeric())
   for (treatment in treatmentList){
     outputData[[treatment]] <- as.numeric()
@@ -141,29 +221,67 @@ scoreTestDataGeneratePolicy <- function(decisionTable, homePath, treatmentList, 
   for (row in 1:nrow(decisionTable)) {
     filteredData <- inputData
     ruleName <- decisionTable$rule[[row]]
+    cohortPolicy <- subset(finalAssignment, finalAssignment[["cohort"]] == ruleName)
+    for (i in 1:length(featureNames)) {
+      feature <- featureNames[[i]]
+      featureRange <- decisionTable[[feature]][[row]]
+      filteredData <- subsetData(filteredData, featureRange, feature)
+    }
+    if (nrow(filteredData) > 0){
+      for (treatmentValue in treatmentList){
+        subset.treatment <- subset(cohortPolicy, cohortPolicy[["treatment"]] == treatmentValue)
+        if (nrow(subset.treatment) > 0){
+          filteredData[[treatmentValue]] <- subset.treatment[[method]]
+        }
+        else{
+          filteredData[[treatmentValue]] <- 0
+        }
+      }
+      outputData <- rbind(outputData, subset(filteredData, select = c("ID", treatmentList)))
+    }
+  }
+  return(outputData)
+}
+
+
+scoreTestDataGeneratePolicyMerged <- function(decisionTable, homePath, treatmentList,  finalAssignment, method = "SGD"){
+  featureNames <- names(decisionTable)[ 4:7]
+  outputData <- data.frame("ID" = as.numeric())
+  for (treatment in treatmentList){
+    outputData[[treatment]] <- as.numeric()
+  }
+  inputData <- fread(paste0(homePath, treatmentList[[1]], 'SimulationDataTest.csv'), sep = ",", stringsAsFactors = FALSE, header = TRUE)
+  for (row in 1:nrow(decisionTable)) {
+    filteredData <- inputData
+    ruleName <- paste("Rule number:", row)
     cohortPolicy <- subset(finalAssignment, cohort == ruleName)
     for (i in 1:length(featureNames)) {
       feature <- featureNames[[i]]
       featureRange <- decisionTable[[feature]][[row]]
       filteredData <- subsetData(filteredData, featureRange, feature)
     }
-    for (treatmentValue in treatmentList){
-      filteredData[[treatmentValue]] <- subset(cohortPolicy, cohortPolicy[["treatment"]] == treatmentValue)[[method]]
+    if (nrow(filteredData) > 0){
+      for (treatmentValue in treatmentList){
+        subset.treatment <- subset(cohortPolicy, cohortPolicy[["treatment"]] == treatmentValue)
+        if (nrow(subset.treatment) > 0){
+          filteredData[[treatmentValue]] <- subset.treatment[[method]]
+        }
+        else{
+          filteredData[[treatmentValue]] <- 0
+        }
+      }
+      outputData <- rbind(outputData, subset(filteredData, select = c("ID", treatmentList)))
     }
-    outputData <- rbind(outputData, subset(filteredData, select = c("ID", treatmentList)))
   }
   return(outputData)
 }
 
-
-
-
 ########################### Helper Functions ##########################
-stochasticOptimization <- function(homePath, utilityData, numCohorts, numTreatments){
+stochasticOptimization <- function(homePath, utilityData, numCohorts, numTreatments, method, taus, alphas){
   ########################### Preparing Simulation Input Data ##########################
   l <- numTreatments # dimension of treatments
-  N <- 500 #iters
-  J <- 20 #number of samples used for evaluate the constraints
+  N <- 250 #iters
+  J <- 10 #number of samples used for evaluate the constraints
   m <- numCohorts # dimension of cohorts
   #utilityData <- utilityData[order(utilityData$cohort, utilityData$treatment),]
   utilityData <- data.frame(utilityData)
@@ -196,8 +314,7 @@ stochasticOptimization <- function(homePath, utilityData, numCohorts, numTreatme
     sigmaVList[[cnt]] <- diag(as.list(sigmaV))
   }
   
-  taus <- c(0.001) # hyperparameter for constraints violation level
-  alphas <- c(0.01) # hyperparameter of the learning rate
+
   for (tau in taus) {
     for (alpha in alphas) {
       results <- list()
@@ -243,7 +360,7 @@ stochasticOptimization <- function(homePath, utilityData, numCohorts, numTreatme
       resultDF <- data.frame("cohort" = utilityData$cohort, "treatment" = utilityData$treatment, "SGD" = csaSGD[[1]], "Adagrad" = csaAdagrad[[1]])
       #writeDetails(outputPath, csaSGD, muU, muVList, tau, alpha, metricDesiredDirectionsList, "SGDDetails")
       #writeDetails(outputPath, csaAdagrad, muU, muVList, tau, alpha, metricDesiredDirectionsList, "AdagradDetails")
-      write.csv(resultDF, file = paste0(outputPath, '/FinalAssignments', tau, "-", alpha, '.csv'), row.names = FALSE, quote = FALSE)
+      write.csv(resultDF, file = paste0(outputPath, '/FinalAssignments', method, tau, "-", alpha, '.csv'), row.names = FALSE, quote = FALSE)
       
       output <- paste0(outputPath, "/ObjVsOneConstraintPlot", tau, "-", alpha, ".pdf")
       plotResults(output, constraintDirection, fxSGDMean, fxAdagradMean, fxSGDStd, fxAdagradStd, fxSGDConstraintMean, fxAdagradConstraintMean, fxSGDConstraintStd, fxAdagradConstraintStd)
@@ -698,11 +815,57 @@ evaluatePolicy <- function(policy, homePath, treatmentList, outcomeList){
   Y3.ATE <- 0
   for (treatment in treatmentList){
     policyW <- policy[[treatment]]
-    testData <- fread(paste0(homePath, treatment, 'SimulationDataTest.csv'), sep = ",", stringsAsFactors = FALSE, header = TRUE)
-    Y1.ATE <- Y1.ATE + mean(policyW * calculateStats(testData, "Y1")[[3]])
-    Y2.ATE <- Y2.ATE + mean(policyW * calculateStats(testData, "Y2")[[3]])
-    Y3.ATE <- Y3.ATE + mean(policyW * calculateStats(testData, "Y3")[[3]])
+    testData <- fread(paste0(homePath, treatment, 'SimulationDataAllTest.csv'), sep = ",", stringsAsFactors = FALSE, header = TRUE)
+    Y1.ATE <- Y1.ATE + mean(policyW * (testData[["Y1"]]-testData[["Y1.0"]]))/mean(testData[["Y1.0"]])
+    Y2.ATE <- Y2.ATE + mean(policyW * (testData[["Y2"]]-testData[["Y2.0"]]))/mean(testData[["Y2.0"]])
+    Y3.ATE <- Y3.ATE + mean(policyW * (testData[["Y3"]]-testData[["Y3.0"]]))/mean(testData[["Y3.0"]])
   }
   outputData <- data.frame("Y1" = c(Y1.ATE), "Y2" = c(Y2.ATE), "Y3" = c(Y3.ATE))
   return(outputData)
 }
+
+createHeuristCohorts <- function(featureNames, homePath, treatmentList){
+  inputData <- fread(paste0(homePath, treatmentList[[1]], 'SimulationDataTraining.csv'), sep = ",", stringsAsFactors = FALSE, header = TRUE)
+  n.total <- nrow(inputData)
+  rule.n <- 1
+  decisionTable <- data.frame("rule" = c(), "cover" = c(), "pcover" = c(), "H1" = c(), "H2" = c(), "H3" = c(), "H4" = c(), "delta" = c(), "deltaPercent" =c(), "pValueDeltaPercent" = c(), "variance" = c())
+
+  list.cohorts <- list(c(0,0,0,0), c(1,0,0,0),c(1,1,0,0),c(1,1,1,0),
+                       c(1,1,1,1), c(0,1,0,0),c(0,1,1,0), c(0,1,1,1),
+                       c(1,0,0,1), c(0,0,1,0),c(0,0,1,1), c(1,1,0,1),
+                       c(1,0,1,0), c(0,0,0,1),c(0,1,0,1), c(1,0,1,1))
+  for (i in list.cohorts){
+    decisionTable <- rbind(decisionTable, data.frame("rule" = c(paste("Rule number:", rule.n)), "cover" = c(NA), "pcover" = c(NA), "H1" = c(NA), "H2" = c(NA), "H3" = c(NA), "H4" = c(NA), "delta" = c(NA), "deltaPercent" =c(NA), "pValueDeltaPercent" = c(NA), "variance" = c(NA)))
+    
+    for (j in 1:length(featureNames)){
+      feature <- featureNames[j]
+      m <- median(inputData[[feature]])
+      featureRange <- if (unlist(i)[[j]] == 0) paste(-Inf,";",m) else paste(m,";",Inf)
+      decisionTable[[feature]][[rule.n]] <- featureRange
+    }
+    rule.n <- rule.n + 1
+  }
+  
+  for (row in 1:nrow(decisionTable)) {
+
+    filteredData <- inputData
+    ruleName <- decisionTable$rule[[row]]
+    pcover <- decisionTable$pcover[[row]]
+    for (i in 1:length(featureNames)) {
+      feature <- featureNames[[i]]
+      featureRange <- decisionTable[[feature]][[row]]
+      filteredData <- subsetData(filteredData, featureRange, feature)
+    }
+    stats<- calculateStats(filteredData, outcome)
+    decisionTable[["rule"]][[row]] <- paste("Rule number:", row)
+    decisionTable[["delta"]][[row]] <- stats[[1]]
+    decisionTable[["cover"]][[row]] <- stats[[4]]
+    decisionTable[["pcover"]][[row]] <- as.double(stats[[4]])/n.total
+    
+  }
+  
+  decisionTable <- decisionTable[, with(decisionTable,order(colnames(decisionTable))) ]
+  decisionTable
+}
+
+
